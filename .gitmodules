@@ -1,0 +1,3 @@
+[submodule "dinging-message-api"]
+	path = dinging-message-api
+	url = https://github.com/jiejiejie113/dinging-message-api.git

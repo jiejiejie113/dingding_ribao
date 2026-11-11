@@ -1,0 +1,32 @@
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+.venv/
+venv/
+
+# Business exports, reports, and delivery records
+excel-dingding/
+exports/
+send-logs/
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.db
+*.sqlite*
+*.log
+*.partial.*
+
+# Python and editor artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+
+# One-off local task registration
+register_once.ps1
