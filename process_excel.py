@@ -1,4 +1,4 @@
-"""按数据透视表1.6的业务规则合并五张表，并刷新 Excel 模板。"""
+"""按数据透视表1.7月份版的业务规则合并五张表，并刷新 Excel 模板。"""
 import argparse
 import ast
 import importlib.util
@@ -10,14 +10,15 @@ from pathlib import Path
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
+from report_period import report_period
 
 ROOT = Path(__file__).resolve().parent
-REFERENCE = Path(r"C:\Users\caohanjie\Desktop\合并转透视表\数据透视表1.6.py")
-TEMPLATE = REFERENCE.parent / "模板.xlsx"
+REFERENCE = ROOT / "1.7数据透视表（月份）.py"
+TEMPLATE = ROOT / "2026-10-16 模板.xlsx"
 
 
 def load_rules():
-    spec = importlib.util.spec_from_file_location("pivot_rules_16", REFERENCE)
+    spec = importlib.util.spec_from_file_location("pivot_rules_17", REFERENCE)
     rules = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rules)
     # 直接读取参考程序的列清单，避免两份业务字段定义逐渐不一致。
@@ -84,7 +85,10 @@ def merge_files(folder, rules, columns):
     for col in ["车办实际总件数", "裁剪总数"]:
         merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
     abnormal = merged["车办实际总件数"] > merged["裁剪总数"]
-    merged = merged.assign(_abnormal=abnormal).sort_values("_abnormal", ascending=False, kind="stable")
+    merged = merged.assign(
+        _abnormal=abnormal,
+        _submitted=pd.to_datetime(merged["办单提交纸样部日期"], errors="coerce"),
+    ).sort_values(["_abnormal", "_submitted"], ascending=[False, False], kind="stable", na_position="last")
     merged = merged[columns["output_columns"]].reset_index(drop=True)
     path = folder / "合并数据_完整提取.xlsx"
     merged.to_excel(path, index=False, sheet_name="数据")
@@ -148,21 +152,17 @@ def refresh_report(source, frame, template, output, rules):
             retry(lambda start=start, chunk=chunk: setattr(
                 sheet.Range(sheet.Cells(start + 1, 1), sheet.Cells(start + len(chunk), len(data.columns))),
                 "Value", chunk))
-        # 模板缓存原本引用整列，改为完整的36列和当前实际行数。
+        # 模板缓存原本引用整列，改为完整字段和当前实际行数。
         caches = retry(lambda: workbook.PivotCaches())
         for index in range(1, retry(lambda: caches.Count) + 1):
             cache = retry(lambda index=index: caches.Item(index))
             retry(lambda: setattr(cache, "MissingItemsLimit", 0))
             retry(cache.Refresh)
+        rebuild_staff_pivot(workbook, sheet, len(data), len(data.columns), retry)
         for ws in rules.get_worksheets(workbook):
             for pivot in retry(lambda ws=ws: list(ws.PivotTables())):
                 retry(pivot.RefreshTable)
-        if datetime.now().weekday() == 0:
-            rules._set_pivot_page_filters_weekend(
-                workbook, (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d"),
-                (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"))
-        else:
-            rules._set_pivot_page_filters(workbook, rules.get_yesterday_date())
+        set_yesterday_filters(workbook, retry)
         fill_brief(workbook, frame, retry)
         abnormal_count = int((frame["车办实际总件数"] > frame["裁剪总数"]).sum())
         if abnormal_count:
@@ -177,6 +177,36 @@ def refresh_report(source, frame, template, output, rules):
     output = publish_report(partial, output)
     logging.info("透视表已生成：%s", output)
     return output
+
+
+def rebuild_staff_pivot(workbook, data_sheet, row_count, column_count, retry):
+    """独立重建师傅透视表，移除旧布局及固定J列公式造成的扩展冲突。"""
+    staff = retry(lambda: workbook.Worksheets("纸样师傅角度"))
+    for pivot in retry(lambda: list(staff.PivotTables())):
+        retry(lambda pivot=pivot: pivot.TableRange2.Clear())
+    retry(lambda: staff.Cells.UnMerge())
+    retry(lambda: staff.Cells.Clear())
+    source = f"'数据'!R1C1:R{row_count + 1}C{column_count}"
+    cache = retry(lambda: workbook.PivotCaches().Create(SourceType=1, SourceData=source))
+    pivot = retry(lambda: cache.CreatePivotTable(TableDestination=staff.Range("A4"), TableName="StaffStatusSummary"))
+    row_field = retry(lambda: pivot.PivotFields("纸样师傅"))
+    retry(lambda: setattr(row_field, "Orientation", 1))
+    col_field = retry(lambda: pivot.PivotFields("纸样完成进度"))
+    retry(lambda: setattr(col_field, "Orientation", 2))
+    retry(lambda: pivot.AddDataField(pivot.PivotFields("东明款号"), "计数项:东明款号", -4112))
+    retry(pivot.RefreshTable)
+    # 未完成口径与简报一致，用明细聚合，不再引用易变的B/C/D列。
+    last_column = retry(lambda: pivot.TableRange2.Column + pivot.TableRange2.Columns.Count)
+    retry(lambda: setattr(staff.Cells(4, last_column + 1), "Value", "师傅"))
+    retry(lambda: setattr(staff.Cells(4, last_column + 2), "Value", "未完成纸样（进行中、未处理）"))
+    values = retry(lambda: data_sheet.Range(data_sheet.Cells(1, 1), data_sheet.Cells(row_count + 1, column_count)).Value)
+    frame = pd.DataFrame(values[1:], columns=values[0])
+    status = frame["纸样完成进度"].fillna("").astype(str).str.replace(r"^\d+", "", regex=True).str.strip()
+    counts = frame.loc[status.isin(["进行中", "未处理"])].groupby("纸样师傅", dropna=False).size()
+    for index, (name, count) in enumerate(counts.items(), 5):
+        retry(lambda index=index, name=name: setattr(staff.Cells(index, last_column + 1), "Value", "未指定" if pd.isna(name) else str(name)))
+        retry(lambda index=index, count=count: setattr(staff.Cells(index, last_column + 2), "Value", int(count)))
+    retry(lambda: staff.UsedRange.Columns.AutoFit())
 
 
 def publish_report(partial, output):
@@ -212,10 +242,7 @@ def fill_brief(workbook, frame, retry):
     today = pd.Timestamp(datetime.now().date())
     submitted = pd.to_datetime(frame["办单提交纸样部日期"], errors="coerce").dt.normalize()
     overdue = unfinished & ((today - submitted).dt.days > 10)
-    yesterday = datetime.now() - timedelta(days=1)
-    label = yesterday.strftime("%m月%d日").lstrip("0")
-    if datetime.now().weekday() == 0:
-        label = (datetime.now() - timedelta(days=2)).strftime("%m月%d日").lstrip("0") + "至" + label
+    _, label, weekly = report_period()
 
     def number(value):
         return f"{float(value or 0):g}"
@@ -233,11 +260,64 @@ def fill_brief(workbook, frame, retry):
         logging.info("简报：%s", text)
 
 
+DATE_FILTERS = {
+    "裁床完成": ["裁衣完成并移交日期（不含时间）"],
+    "办单数量变化": ["办单提交纸样部日期（不含时间）", "纸样完成并转至排唛日期（不含时间）"],
+    "车衣完成": ["车办改转态日期（不含时间）"],
+}
+
+
+def set_yesterday_filters(workbook, retry):
+    dates, label, weekly = report_period()
+    for sheet_name, names in DATE_FILTERS.items():
+        sheet = retry(lambda: workbook.Worksheets(sheet_name))
+        pivots = retry(lambda: list(sheet.PivotTables()))
+        if len(pivots) != len(names):
+            raise ValueError(f"{sheet_name} 透视表数量与日期配置不符")
+        pivots.sort(key=lambda pivot: retry(lambda: pivot.TableRange1.Column))
+        for pivot, name in zip(pivots, names):
+            field = retry(lambda: pivot.PivotFields(name))
+            retry(lambda: setattr(field, "Orientation", 3))
+            retry(field.ClearAllFilters)
+            if weekly:
+                retry(lambda: setattr(pivot, "ManualUpdate", True))
+                retry(lambda: setattr(field, "EnableMultiplePageItems", True))
+                items = retry(lambda: list(field.PivotItems()))
+                matching = [item for item in items if retry(lambda item=item: item.Name) in dates]
+                if not matching:
+                    raise ValueError(f"{sheet_name} 上周没有可用日期，停止生成，避免错误统计全部数据")
+                for item in matching:
+                    retry(lambda item=item: setattr(item, "Visible", True))
+                for item in items:
+                    if retry(lambda item=item: item.Name) not in dates:
+                        retry(lambda item=item: setattr(item, "Visible", False))
+                # Excel 切换多选时可能重新显示空白项，按名称重新获取后再次隐藏。
+                for _ in range(2):
+                    for item in retry(lambda: list(field.PivotItems())):
+                        item_name = retry(lambda item=item: item.Name)
+                        if item_name not in dates and retry(lambda item=item: item.Visible):
+                            retry(lambda item_name=item_name: setattr(field.PivotItems(item_name), "Visible", False))
+                retry(lambda: setattr(pivot, "ManualUpdate", False))
+                retry(pivot.Update)
+                selected = {retry(lambda item=item: item.Name) for item in retry(lambda: list(field.PivotItems())) if retry(lambda item=item: item.Visible)}
+                expected = {retry(lambda item=item: item.Name) for item in matching}
+                if selected - {"(blank)", "(空白)"} != expected:
+                    raise ValueError(f"{sheet_name} 上周日期筛选失败：{selected}")
+            else:
+                retry(lambda: setattr(field, "EnableMultiplePageItems", False))
+                retry(lambda: setattr(field, "CurrentPage", dates[0]))
+                if retry(lambda: field.CurrentPage.Name) != dates[0]:
+                    raise ValueError(f"{sheet_name} 昨日筛选失败")
+            logging.info("日期筛选：%s / %s = %s", sheet_name, name, label)
+
+
 def process(folder, template=TEMPLATE, merge_only=False):
     rules, columns = load_rules()
     source, frame = merge_files(folder, rules, columns)
     if not merge_only and not frame.empty:
-        report = refresh_report(source, frame, template, folder / (datetime.now().strftime("%Y-%m-%d") + " 数据透视表.xlsx"), rules)
+        _, _, weekly = report_period()
+        report_name = " 上周周报.xlsx" if weekly else " 数据透视表.xlsx"
+        report = refresh_report(source, frame, template, folder / (datetime.now().strftime("%Y-%m-%d") + report_name), rules)
         import json
         manifest = folder / "latest_report.json"
         temporary = manifest.with_suffix(".tmp")

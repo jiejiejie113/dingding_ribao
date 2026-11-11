@@ -21,8 +21,9 @@ def format_brief(lines):
     sewing, sewn_qty, sew_plan, sewn_cut = extract(
         r"车衣款数：([\d.]+)款；车衣数量：([\d.]+)件；计划件数：([\d.]+)件；裁剪件数：([\d.]+)件", lines[4])
     label = re.sub(r"0(\d)日", r"\1日", label)
+    heading = f"## 上周周报\n\n统计日期：{label}" if "至" in label else f"## {label}生产日报"
     return (
-        f"## {label}生产日报\n\n"
+        f"{heading}\n\n"
         f"### 办单与纸样\n\n"
         f"- 新增办单：{new}个\n"
         f"- 完成纸样：{completed}个\n"

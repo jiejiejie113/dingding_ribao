@@ -6,10 +6,14 @@ import xml.etree.ElementTree as ET
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 
 def verify(folder, report=None):
-    report = report or folder / (datetime.now().strftime("%Y-%m-%d") + " 数据透视表.xlsx")
+    if report is None:
+        import json
+        manifest = folder / "latest_report.json"
+        report = Path(json.loads(manifest.read_text(encoding="utf-8"))["report"]) if manifest.exists() else folder / (datetime.now().strftime("%Y-%m-%d") + " 数据透视表.xlsx")
     merged = pd.read_excel(folder / "合并数据_完整提取.xlsx", dtype=object)
     removed = pd.read_excel(folder / "剔除数据表.xlsx", dtype=object)
     keys = ["东明款号", "办名称", "重做版次", "品牌&部门"]
@@ -19,11 +23,24 @@ def verify(folder, report=None):
     assert removed["制办单分配进度"].isna().all()
     assert (removed["是否经过纸样部"] == "需要").all()
     assert (removed["超时天数"] > 3).all()
+    from process_excel import load_rules, TEMPLATE
+    _, columns = load_rules()
+    assert list(merged.columns) == columns["output_columns"], "数据列与1.7字段清单不一致"
+    for date in ["办单提交纸样部日期", "纸样完成并转至排唛日期", "裁衣完成并移交日期", "车办改转态日期"]:
+        expected = pd.to_datetime(merged[date], errors="coerce").dt.strftime("%Y-%m").fillna("")
+        assert (expected == merged[date + "（年月）"].fillna("")).all(), f"年月字段错误：{date}"
+    abnormal = pd.to_numeric(merged["车办实际总件数"]) > pd.to_numeric(merged["裁剪总数"])
+    assert abnormal.astype(int).is_monotonic_decreasing, "异常行未置顶"
+    for flag in [True, False]:
+        submitted = pd.to_datetime(merged.loc[abnormal == flag, "办单提交纸样部日期"], errors="coerce").dropna()
+        assert submitted.is_monotonic_decreasing, "提交日期未按新到旧排序"
     workbook = load_workbook(report, read_only=True, data_only=True)
     try:
         rows = iter(workbook["数据"].values)
         actual = pd.DataFrame(rows, columns=next(rows))
         assert actual.shape == merged.shape
+        errors = [(s.title, c.coordinate, c.value) for s in workbook if s.title != "数据" for row in s for c in row if c.data_type == "e"]
+        assert not errors, f"报表存在错误单元格：{errors}"
         for col in merged.columns:
             left, right = merged[col].fillna(""), actual[col].fillna("")
             same = left.astype(str) == right.astype(str)
@@ -44,15 +61,18 @@ def verify(folder, report=None):
             if name.startswith("xl/pivotCache/pivotCacheDefinition") and name.endswith(".xml"):
                 root = ET.fromstring(archive.read(name))
                 assert int(root.get("recordCount")) == len(merged)
-                assert root.find("m:cacheSource/m:worksheetSource", namespace).get("ref") == f"A1:AJ{len(merged)+1}"
+                assert root.find("m:cacheSource/m:worksheetSource", namespace).get("ref") == f"A1:{get_column_letter(len(merged.columns))}{len(merged)+1}"
                 caches[name] = root
         pivots = [name for name in archive.namelist() if name.startswith("xl/pivotTables/pivotTable") and name.endswith(".xml")]
-        assert len(pivots) == 7
+        with ZipFile(TEMPLATE) as template:
+            expected_count = sum(name.startswith("xl/pivotTables/pivotTable") and name.endswith(".xml") for name in template.namelist())
+        assert len(pivots) == expected_count
         # 通过关系文件找到每张透视表缓存，检查四个日期页字段真实选中项。
         dates = {"裁衣完成并移交日期（不含时间）", "办单提交纸样部日期（不含时间）",
                  "纸样完成并转至排唛日期（不含时间）", "车办改转态日期（不含时间）"}
         checked = []
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        from report_period import report_period
+        period_dates, _, weekly = report_period()
         import posixpath
         for name in pivots:
             pivot = ET.fromstring(archive.read(name))
@@ -64,14 +84,21 @@ def verify(folder, report=None):
                 field = fields[int(page.get("fld"))]
                 if field.get("name") not in dates:
                     continue
-                if datetime.now().weekday() != 0:
-                    item = pivot.findall("m:pivotFields/m:pivotField", namespace)[int(page.get("fld"))].findall("m:items/m:item", namespace)[int(page.get("item"))]
-                    value = list(field.find("m:sharedItems", namespace))[int(item.get("x"))].get("v")
-                    assert value == yesterday, (field.get("name"), value)
-                    checked.append(field.get("name"))
-        if datetime.now().weekday() != 0:
-            assert set(checked) == dates
-        print("PASS 文件完整性、7张透视表、缓存实际范围及昨日筛选")
+                items = pivot.findall("m:pivotFields/m:pivotField", namespace)[int(page.get("fld"))].findall("m:items/m:item", namespace)
+                shared = list(field.find("m:sharedItems", namespace))
+                if weekly:
+                    values = {shared[int(item.get("x"))].get("v") for item in items if item.get("x") is not None and item.get("h", "0") != "1"}
+                    expected = {item.get("v") for item in shared if item.get("v") in period_dates}
+                    assert values == expected and values, (field.get("name"), values, expected)
+                else:
+                    item = items[int(page.get("item"))]
+                    value = shared[int(item.get("x"))].get("v")
+                    assert value == period_dates[0], (field.get("name"), value)
+                checked.append(field.get("name"))
+        assert set(checked) == dates
+        assert len(checked) == 4, "仅四个日报/周报日期筛选，月份表不应加入日期筛选"
+        print(f"PASS 文件完整性、{len(pivots)}张透视表、缓存实际范围及{'上周' if weekly else '昨日'}筛选")
+        print("PASS 四个年月字段、异常置顶与提交日期倒序、工作表无错误单元格")
     print(f"PASS 数量守恒及剔除规则：保留{len(merged)}，剔除{len(removed)}")
 
 

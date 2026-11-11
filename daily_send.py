@@ -86,7 +86,7 @@ def run(args, logs, today):
             workbook.close()
         # 固定本次附件，发送重试时不受重新导出影响。
         import shutil
-        attachment = logs / (batch + " 数据透视表.xlsx")
+        attachment = logs / (batch + (" 上周周报.xlsx" if "至" in lines[0] else " 数据透视表.xlsx"))
         shutil.copy2(report, attachment)
         state = {"report": str(attachment), "brief": "\n".join(lines),
                  "sha256": hashlib.sha256(attachment.read_bytes()).hexdigest(), "group": GROUP}
